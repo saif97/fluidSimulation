@@ -29,6 +29,17 @@ class FluidApp extends StatelessWidget {
 
 enum Tool { stir, circle, box, triangle, eraser }
 
+enum RenderMode { ink, particles, heat }
+
+/// Jet-style colormap (blue → cyan → green → yellow → red), t in 0..1.
+int _jetArgb(double t) {
+  int ch(double v) => (v.clamp(0.0, 1.0) * 255).round();
+  return 0xFF000000 |
+      (ch(1.5 - (4 * t - 3).abs()) << 16) |
+      (ch(1.5 - (4 * t - 2).abs()) << 8) |
+      ch(1.5 - (4 * t - 1).abs());
+}
+
 class SimulationPage extends StatefulWidget {
   const SimulationPage({super.key});
 
@@ -38,10 +49,32 @@ class SimulationPage extends StatefulWidget {
 
 class _SimulationPageState extends State<SimulationPage>
     with SingleTickerProviderStateMixin {
-  /// Long-side cell count. Kept modest so dart2js hits 60 fps.
-  static const int _maxGridSide = 128;
-  static const double _splatRadiusCells = 4.5;
   static const double _maxInjectSpeed = 400; // cells/sec
+
+  // ---- User-tunable settings (settings shelf) ----
+  /// Long-side cell count; higher = sharper dye but more CPU per frame.
+  int _gridSide = 192;
+  double _vorticity = 1.4;
+  double _dyeFade = 0.9975;
+  double _splatRadius = 4.5;
+  double _wind = 70; // cells/sec left-to-right inflow; 0 = closed box
+  bool _settingsOpen = false;
+  bool _showIntro = true;
+  RenderMode _mode = RenderMode.ink;
+  int _warmup = 0; // frames to pre-simulate at startup (?warmup=N)
+
+  // Tracer particles (particles render mode), advected through the velocity
+  // field and bucketed by speed into one draw call per colormap stop.
+  static const int _particleCount = 12000;
+  static const double _speedScale = 150; // cells/sec at colormap top end
+  final math.Random _rng = math.Random(7);
+  Float32List _partX = Float32List(0);
+  Float32List _partY = Float32List(0);
+  final List<Float32List> _bucketBuf = List.generate(
+      _FluidPainter.bucketColors.length,
+      (_) => Float32List(_particleCount * 2));
+  final Int32List _bucketLen = Int32List(_FluidPainter.bucketColors.length);
+  final ValueNotifier<int> _frame = ValueNotifier(0);
 
   late final Ticker _ticker;
   FluidSolver? _solver;
@@ -54,7 +87,10 @@ class _SimulationPageState extends State<SimulationPage>
   Int32List _colors = Int32List(0);
   final ValueNotifier<ui.Vertices?> _mesh = ValueNotifier(null);
 
-  final List<Obstacle> _obstacles = [];
+  final List<Obstacle> _obstacles = [
+    // Default obstacle so the wind tunnel sheds vortices from frame one.
+    Obstacle(shape: ObstacleShape.circle, x: 0.28, y: 0.5, size: 0.09),
+  ];
   Obstacle? _dragged;
   Tool _tool = Tool.stir;
 
@@ -65,6 +101,15 @@ class _SimulationPageState extends State<SimulationPage>
   @override
   void initState() {
     super.initState();
+    // Deep links: ?mode=ink|particles|heat&intro=0&warmup=<frames>
+    final qp = Uri.base.queryParameters;
+    if (qp['intro'] == '0') _showIntro = false;
+    _warmup = int.tryParse(qp['warmup'] ?? '') ?? 0;
+    _mode = switch (qp['mode']) {
+      'particles' => RenderMode.particles,
+      'heat' => RenderMode.heat,
+      _ => RenderMode.ink,
+    };
     _ticker = createTicker(_onTick)..start();
   }
 
@@ -73,6 +118,7 @@ class _SimulationPageState extends State<SimulationPage>
     _ticker.dispose();
     _mesh.value?.dispose();
     _mesh.dispose();
+    _frame.dispose();
     super.dispose();
   }
 
@@ -82,15 +128,46 @@ class _SimulationPageState extends State<SimulationPage>
     final aspect = size.width / size.height;
     int gw, gh;
     if (aspect >= 1) {
-      gw = _maxGridSide;
-      gh = (_maxGridSide / aspect).round().clamp(48, _maxGridSide);
+      gw = _gridSide;
+      gh = (_gridSide / aspect).round().clamp(48, _gridSide);
     } else {
-      gh = _maxGridSide;
-      gw = (_maxGridSide * aspect).round().clamp(48, _maxGridSide);
+      gh = _gridSide;
+      gw = (_gridSide * aspect).round().clamp(48, _gridSide);
+    }
+    // Mesh indices are Uint16, so the vertex count must stay under 65536.
+    while ((gw + 2) * (gh + 2) > 65535) {
+      gw = (gw * 0.97).floor();
+      gh = (gh * 0.97).floor();
     }
     _solver = FluidSolver(w: gw, h: gh, aspect: aspect)
+      ..vorticity = _vorticity
+      ..dyeDissipation = _dyeFade
+      ..windSpeed = _wind
       ..rebuildSolids(_obstacles);
     _buildMesh(_solver!, size);
+    _initParticles(_solver!);
+    if (_warmup > 0) {
+      final s = _solver!;
+      for (int i = 0; i < _warmup; i++) {
+        if (_wind > 0 && _mode == RenderMode.ink) _seedStreaks(s);
+        s.step(1 / 60);
+        if (_mode == RenderMode.particles) _stepParticles(s, 1 / 60);
+      }
+      _warmup = 0;
+    }
+  }
+
+  /// Quality change: rebuild the solver at the new resolution. Obstacles are
+  /// normalized so they survive; dye/velocity restart from rest.
+  void _setGridSide(int side) {
+    if (side == _gridSide) return;
+    setState(() {
+      _gridSide = side;
+      _solver = null;
+      final size = _canvasSize;
+      _canvasSize = Size.zero;
+      if (size != Size.zero) _ensureSolver(size);
+    });
   }
 
   /// One vertex per grid cell (including the border ring, clamped to the
@@ -135,6 +212,49 @@ class _SimulationPageState extends State<SimulationPage>
           ((math.sqrt(cg) * 255).toInt() << 8) |
           (math.sqrt(cb) * 255).toInt();
     }
+    // Solid cells hold zero dye, which gouraud-interpolates to a black
+    // staircase around obstacles. Give them the average of their fluid
+    // neighbors so the dye continues smoothly under the drawn shape.
+    final solid = s.solid;
+    final stride = s.stride;
+    for (int k = 0; k < n; k++) {
+      if (solid[k] == 0) continue;
+      final i = k % stride;
+      double cr = 0, cg = 0, cb = 0;
+      int cnt = 0;
+      if (i > 0 && solid[k - 1] == 0) {
+        cr += s.r[k - 1];
+        cg += s.g[k - 1];
+        cb += s.b[k - 1];
+        cnt++;
+      }
+      if (i < stride - 1 && solid[k + 1] == 0) {
+        cr += s.r[k + 1];
+        cg += s.g[k + 1];
+        cb += s.b[k + 1];
+        cnt++;
+      }
+      if (k >= stride && solid[k - stride] == 0) {
+        cr += s.r[k - stride];
+        cg += s.g[k - stride];
+        cb += s.b[k - stride];
+        cnt++;
+      }
+      if (k + stride < n && solid[k + stride] == 0) {
+        cr += s.r[k + stride];
+        cg += s.g[k + stride];
+        cb += s.b[k + stride];
+        cnt++;
+      }
+      if (cnt == 0) continue;
+      cr = (cr / cnt).clamp(0.0, 1.0);
+      cg = (cg / cnt).clamp(0.0, 1.0);
+      cb = (cb / cnt).clamp(0.0, 1.0);
+      _colors[k] = 0xFF000000 |
+          ((math.sqrt(cr) * 255).toInt() << 16) |
+          ((math.sqrt(cg) * 255).toInt() << 8) |
+          (math.sqrt(cb) * 255).toInt();
+    }
     final verts = ui.Vertices.raw(
       ui.VertexMode.triangles,
       _positions,
@@ -157,8 +277,125 @@ class _SimulationPageState extends State<SimulationPage>
     _fpsEma = _fpsEma * 0.95 + (1 / dt) * 0.05;
     _hue = (_hue + dt * 40) % 360;
 
+    if (_wind > 0 && _mode == RenderMode.ink) _seedStreaks(solver);
     solver.step(dt);
-    _updateMesh(solver);
+    switch (_mode) {
+      case RenderMode.ink:
+        _updateMesh(solver);
+      case RenderMode.heat:
+        _updateHeatMesh(solver);
+      case RenderMode.particles:
+        _stepParticles(solver, dt);
+    }
+    _frame.value++;
+  }
+
+  /// Colors every mesh vertex by local speed through the jet colormap.
+  void _updateHeatMesh(FluidSolver s) {
+    final n = _colors.length;
+    for (int k = 0; k < n; k++) {
+      final spd = math.sqrt(s.u[k] * s.u[k] + s.v[k] * s.v[k]);
+      _colors[k] = _jetArgb(math.sqrt((spd / _speedScale).clamp(0.0, 1.0)));
+    }
+    final verts = ui.Vertices.raw(
+      ui.VertexMode.triangles,
+      _positions,
+      colors: _colors,
+      indices: _meshIndices,
+    );
+    _mesh.value?.dispose();
+    _mesh.value = verts;
+  }
+
+  /// Rainbow dye streaklines emitted at the inlet (wind tunnel, ink mode).
+  void _seedStreaks(FluidSolver s) {
+    const streams = 9;
+    for (int i = 0; i < streams; i++) {
+      final color =
+          HSVColor.fromAHSV(1, 360 * i / streams, 0.75, 1).toColor();
+      s.splat(
+        cx: 2.5,
+        cy: (i + 0.5) / streams * s.h + 0.5,
+        radius: 1.6,
+        dyeR: color.r * 0.4,
+        dyeG: color.g * 0.4,
+        dyeB: color.b * 0.4,
+      );
+    }
+  }
+
+  void _initParticles(FluidSolver s) {
+    _partX = Float32List(_particleCount);
+    _partY = Float32List(_particleCount);
+    // Uniform initial fill (even with wind on); ones inside solids respawn.
+    for (int n = 0; n < _particleCount; n++) {
+      _partX[n] = 0.5 + _rng.nextDouble() * s.w;
+      _partY[n] = 0.5 + _rng.nextDouble() * s.h;
+    }
+  }
+
+  void _respawnParticle(FluidSolver s, int n) {
+    // With wind on, recycle particles at the inlet for streamline trails.
+    final spanX = _wind > 0 ? 2.0 : s.w.toDouble();
+    for (int tries = 0; tries < 8; tries++) {
+      final x = 0.5 + _rng.nextDouble() * spanX;
+      final y = 0.5 + _rng.nextDouble() * s.h;
+      final k =
+          x.round().clamp(1, s.w) + y.round().clamp(1, s.h) * s.stride;
+      if (s.solid[k] == 0) {
+        _partX[n] = x;
+        _partY[n] = y;
+        return;
+      }
+    }
+    _partX[n] = 0.5 + _rng.nextDouble() * s.w;
+    _partY[n] = 0.5 + _rng.nextDouble() * s.h;
+  }
+
+  /// Advects tracers through the velocity field and fills the per-speed
+  /// bucket point buffers (canvas pixels) for rendering.
+  void _stepParticles(FluidSolver s, double dt) {
+    _bucketLen.fillRange(0, _bucketLen.length, 0);
+    final pw = _canvasSize.width, ph = _canvasSize.height;
+    final wMax = s.w + 0.5, hMax = s.h + 0.5;
+    final buckets = _bucketBuf.length;
+    final stride = s.stride;
+    for (int n = 0; n < _particleCount; n++) {
+      double x = _partX[n], y = _partY[n];
+      // Bilinear velocity sample in the solver's cell-center space.
+      final sx = x.clamp(0.5, wMax), sy = y.clamp(0.5, hMax);
+      final i0 = sx.floor(), j0 = sy.floor();
+      final s1 = sx - i0, s0 = 1 - s1, t1 = sy - j0, t0 = 1 - t1;
+      final k00 = i0 + j0 * stride;
+      final vx = s0 * (t0 * s.u[k00] + t1 * s.u[k00 + stride]) +
+          s1 * (t0 * s.u[k00 + 1] + t1 * s.u[k00 + stride + 1]);
+      final vy = s0 * (t0 * s.v[k00] + t1 * s.v[k00 + stride]) +
+          s1 * (t0 * s.v[k00 + 1] + t1 * s.v[k00 + stride + 1]);
+      x += vx * dt;
+      y += vy * dt;
+      bool dead = x < 0.5 || x > wMax || y < 0.5 || y > hMax;
+      if (!dead) {
+        final k =
+            x.round().clamp(1, s.w) + y.round().clamp(1, s.h) * stride;
+        dead = s.solid[k] != 0;
+      }
+      // Small random respawn keeps stagnant pools from going stale.
+      if (dead || _rng.nextDouble() < 0.002) {
+        _respawnParticle(s, n);
+        continue;
+      }
+      _partX[n] = x;
+      _partY[n] = y;
+      final spd = math.sqrt(vx * vx + vy * vy);
+      final t = math.sqrt((spd / _speedScale).clamp(0.0, 1.0));
+      int b = (t * buckets).floor();
+      if (b >= buckets) b = buckets - 1;
+      final len = _bucketLen[b];
+      final buf = _bucketBuf[b];
+      buf[len] = (x - 0.5) / s.w * pw;
+      buf[len + 1] = (y - 0.5) / s.h * ph;
+      _bucketLen[b] = len + 2;
+    }
   }
 
   // ---- Input ----------------------------------------------------------
@@ -253,7 +490,7 @@ class _SimulationPageState extends State<SimulationPage>
     solver.splat(
       cx: norm.dx * solver.w + 0.5,
       cy: norm.dy * solver.h + 0.5,
-      radius: _splatRadiusCells,
+      radius: _splatRadius,
       // ~drag speed in cells/sec assuming 60 fps event cadence.
       velX: (deltaN.dx * solver.w * 60).clamp(-_maxInjectSpeed, _maxInjectSpeed),
       velY: (deltaN.dy * solver.h * 60).clamp(-_maxInjectSpeed, _maxInjectSpeed),
@@ -307,6 +544,13 @@ class _SimulationPageState extends State<SimulationPage>
                     painter: _FluidPainter(
                       mesh: _mesh,
                       obstacles: _obstacles,
+                      mode: _mode,
+                      bucketBuf: _bucketBuf,
+                      bucketLen: _bucketLen,
+                      repaint: _frame,
+                      cellPad: _solver == null
+                          ? 0
+                          : constraints.biggest.height / _solver!.h * 0.75,
                     ),
                     size: constraints.biggest,
                   ),
@@ -327,8 +571,17 @@ class _SimulationPageState extends State<SimulationPage>
           ),
           Align(
             alignment: Alignment.bottomCenter,
-            child: SafeArea(child: _buildToolbar()),
+            child: SafeArea(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_settingsOpen) _buildSettings(),
+                  _buildToolbar(),
+                ],
+              ),
+            ),
           ),
+          if (_showIntro) _buildIntro(),
         ],
       ),
     );
@@ -357,9 +610,160 @@ class _SimulationPageState extends State<SimulationPage>
             color: Colors.white24,
           ),
           IconButton(
+            tooltip: 'Render mode: ${_mode.name} (tap to cycle)',
+            icon: Icon(switch (_mode) {
+              RenderMode.ink => Icons.water_drop_outlined,
+              RenderMode.particles => Icons.grain,
+              RenderMode.heat => Icons.thermostat,
+            }),
+            color: Colors.white70,
+            onPressed: () => setState(() {
+              _mode = RenderMode
+                  .values[(_mode.index + 1) % RenderMode.values.length];
+            }),
+          ),
+          IconButton(
             tooltip: 'Clear everything',
             icon: const Icon(Icons.delete_outline),
             onPressed: _clearAll,
+          ),
+          IconButton(
+            tooltip: 'Settings',
+            icon: const Icon(Icons.tune),
+            color: _settingsOpen ? Colors.cyanAccent : Colors.white70,
+            onPressed: () => setState(() => _settingsOpen = !_settingsOpen),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSettings() {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+      padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+      constraints: const BoxConstraints(maxWidth: 400),
+      decoration: BoxDecoration(
+        color: const Color(0xF21A2027),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Simulation quality',
+              style: TextStyle(color: Colors.white70, fontSize: 12)),
+          const SizedBox(height: 6),
+          SegmentedButton<int>(
+            showSelectedIcon: false,
+            style: const ButtonStyle(visualDensity: VisualDensity.compact),
+            segments: const [
+              ButtonSegment(value: 96, label: Text('Low')),
+              ButtonSegment(value: 128, label: Text('Med')),
+              ButtonSegment(value: 192, label: Text('High')),
+              ButtonSegment(value: 256, label: Text('Ultra')),
+            ],
+            selected: {_gridSide},
+            onSelectionChanged: (s) => _setGridSide(s.first),
+          ),
+          const SizedBox(height: 6),
+          _settingSlider('Wind', _wind, 0, 200, (v) {
+            _wind = v;
+            final s = _solver;
+            if (s != null) {
+              s.windSpeed = v;
+              s.rebuildSolids(_obstacles);
+            }
+          }),
+          _settingSlider('Swirl', _vorticity, 0, 4, (v) {
+            _vorticity = v;
+            _solver?.vorticity = v;
+          }),
+          _settingSlider('Ink lifetime', _dyeFade, 0.985, 1, (v) {
+            _dyeFade = v;
+            _solver?.dyeDissipation = v;
+          }),
+          _settingSlider('Brush size', _splatRadius, 2, 10, (v) {
+            _splatRadius = v;
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _settingSlider(String label, double value, double min, double max,
+      ValueChanged<double> onChanged) {
+    return Row(
+      children: [
+        SizedBox(
+          width: 84,
+          child: Text(label,
+              style: const TextStyle(color: Colors.white70, fontSize: 12)),
+        ),
+        Expanded(
+          child: Slider(
+            value: value,
+            min: min,
+            max: max,
+            onChanged: (v) => setState(() => onChanged(v)),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildIntro() {
+    return Positioned.fill(
+      child: GestureDetector(
+        onTap: () => setState(() => _showIntro = false),
+        child: Container(
+          color: Colors.black.withValues(alpha: 0.74),
+          alignment: Alignment.center,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Fluid Simulator',
+                style: TextStyle(
+                  fontSize: 34,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white,
+                ),
+              ),
+              const SizedBox(height: 28),
+              _introRow(Icons.gesture, 'Drag anywhere to stir in colorful ink'),
+              _introRow(Icons.circle_outlined,
+                  'Pick a shape, then tap the canvas to drop obstacles'),
+              _introRow(
+                  Icons.open_with, 'Drag obstacles around to push the fluid'),
+              _introRow(Icons.grain,
+                  'Cycle render modes: ink, particles, heat map'),
+              _introRow(Icons.tune, 'Tune quality, swirl and brush in settings'),
+              const SizedBox(height: 32),
+              FilledButton(
+                onPressed: () => setState(() => _showIntro = false),
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                  child: Text('Start playing'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _introRow(IconData icon, String text) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: Colors.cyanAccent, size: 20),
+          const SizedBox(width: 12),
+          Flexible(
+            child: Text(text, style: const TextStyle(color: Colors.white70)),
           ),
         ],
       ),
@@ -379,19 +783,53 @@ class _SimulationPageState extends State<SimulationPage>
 }
 
 class _FluidPainter extends CustomPainter {
-  _FluidPainter({required this.mesh, required this.obstacles})
-      : super(repaint: mesh);
+  _FluidPainter({
+    required this.mesh,
+    required this.obstacles,
+    required this.mode,
+    required this.bucketBuf,
+    required this.bucketLen,
+    required this.cellPad,
+    required Listenable repaint,
+  }) : super(repaint: repaint);
+
+  /// One color stop per particle speed bucket, from the jet colormap.
+  static final List<Color> bucketColors =
+      List.generate(6, (i) => Color(_jetArgb((i + 0.5) / 6)));
 
   final ValueNotifier<ui.Vertices?> mesh;
   final List<Obstacle> obstacles;
+  final RenderMode mode;
+  final List<Float32List> bucketBuf;
+  final Int32List bucketLen;
+
+  /// Outward padding (px) so the smooth vector shape covers the obstacle's
+  /// blocky rasterized footprint on the sim grid.
+  final double cellPad;
 
   @override
   void paint(Canvas canvas, Size size) {
     canvas.drawRect(Offset.zero & size, Paint()..color = Colors.black);
-    final vertices = mesh.value;
-    if (vertices != null) {
-      // BlendMode.dst keeps the per-vertex colors as-is.
-      canvas.drawVertices(vertices, BlendMode.dst, Paint());
+    if (mode == RenderMode.particles) {
+      final p = Paint()
+        ..strokeCap = StrokeCap.round
+        ..strokeWidth = 3;
+      for (int b = 0; b < bucketColors.length; b++) {
+        final len = bucketLen[b];
+        if (len == 0) continue;
+        p.color = bucketColors[b];
+        canvas.drawRawPoints(
+          ui.PointMode.points,
+          Float32List.view(bucketBuf[b].buffer, 0, len),
+          p,
+        );
+      }
+    } else {
+      final vertices = mesh.value;
+      if (vertices != null) {
+        // BlendMode.dst keeps the per-vertex colors as-is.
+        canvas.drawVertices(vertices, BlendMode.dst, Paint());
+      }
     }
     final fill = Paint()..color = const Color(0xFF2B3440);
     final outline = Paint()
@@ -400,7 +838,10 @@ class _FluidPainter extends CustomPainter {
       ..color = Colors.white38;
     for (final o in obstacles) {
       final c = Offset(o.x * size.width, o.y * size.height);
-      final r = o.size * size.height;
+      // Inflate so the vector shape hides the rasterized cells; an offset
+      // of d grows an equilateral triangle's circumradius by 2d.
+      final r = o.size * size.height +
+          (o.shape == ObstacleShape.triangle ? cellPad * 2 : cellPad);
       final path = _shapePath(o.shape, c, r);
       canvas.drawPath(path, fill);
       canvas.drawPath(path, outline);

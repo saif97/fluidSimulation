@@ -92,6 +92,11 @@ class FluidSolver {
   double dyeDissipation = 0.9975;
   int pressureIterations = 18;
 
+  /// Steady left-to-right inflow in cells/sec. When > 0 the left/right
+  /// borders become open (inlet / zero-gradient outlet) instead of walls.
+  /// Callers must rebuildSolids() after changing this.
+  double windSpeed = 0;
+
   int _idx(int i, int j) => i + j * stride;
 
   /// Re-rasterizes the solid mask from [obstacles] plus the domain border.
@@ -103,9 +108,11 @@ class FluidSolver {
       solid[_idx(i, 0)] = 1;
       solid[_idx(i, h + 1)] = 1;
     }
-    for (int j = 0; j < h + 2; j++) {
-      solid[_idx(0, j)] = 1;
-      solid[_idx(w + 1, j)] = 1;
+    if (windSpeed <= 0) {
+      for (int j = 0; j < h + 2; j++) {
+        solid[_idx(0, j)] = 1;
+        solid[_idx(w + 1, j)] = 1;
+      }
     }
     for (final o in obstacles) {
       for (int j = 1; j <= h; j++) {
@@ -160,15 +167,40 @@ class FluidSolver {
 
   void step(double dt) {
     _enforceSolids();
+    if (windSpeed > 0) _applyWind();
     _confineVorticity(dt);
     _swapVelocity();
     _advect(u, _u0, _u0, _v0, dt, velocityDissipation);
     _advect(v, _v0, _u0, _v0, dt, velocityDissipation);
     _project();
+    if (windSpeed > 0) _applyWind();
     _swapDye();
     _advect(r, _r0, u, v, dt, dyeDissipation);
     _advect(g, _g0, u, v, dt, dyeDissipation);
     _advect(b, _b0, u, v, dt, dyeDissipation);
+  }
+
+  /// Inlet: fixed horizontal velocity in the two leftmost columns.
+  /// Outlet: zero-gradient velocity and dye in the right border column
+  /// (pressure there is implicitly Dirichlet 0, letting mass leave).
+  void _applyWind() {
+    for (int j = 1; j <= h; j++) {
+      final row = j * stride;
+      for (int i = 0; i <= 1; i++) {
+        final k = row + i;
+        if (solid[k] != 0) continue;
+        u[k] = windSpeed;
+        v[k] = 0;
+      }
+      final ko = row + w + 1;
+      if (solid[ko] == 0) {
+        u[ko] = u[ko - 1];
+        v[ko] = v[ko - 1];
+        r[ko] = r[ko - 1];
+        g[ko] = g[ko - 1];
+        b[ko] = b[ko - 1];
+      }
+    }
   }
 
   void _enforceSolids() {

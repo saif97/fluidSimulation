@@ -48,6 +48,27 @@ void main() {
     expect(solver.r[k], 0);
   });
 
+  test('wind tunnel drives steady left-to-right flow and stays finite', () {
+    final solver = FluidSolver(w: 96, h: 64, aspect: 1.5)
+      ..windSpeed = 100
+      ..rebuildSolids([Obstacle(shape: ObstacleShape.circle, x: 0.3, y: 0.5)]);
+    for (int frame = 0; frame < 240; frame++) {
+      solver.step(1 / 60);
+    }
+    double sumU = 0;
+    int fluidCells = 0;
+    for (int k = 0; k < solver.cells; k++) {
+      expect(solver.u[k].isFinite, isTrue);
+      expect(solver.v[k].isFinite, isTrue);
+      if (solver.solid[k] == 0) {
+        sumU += solver.u[k];
+        fluidCells++;
+      }
+    }
+    expect(sumU / fluidCells, greaterThan(20),
+        reason: 'mean flow should follow the wind, not recirculate');
+  });
+
   test('steps fast enough for real time (ballpark, JIT)', () {
     final solver = FluidSolver(w: 128, h: 96, aspect: 4 / 3);
     final pixels = Uint8List(128 * 96 * 4);
