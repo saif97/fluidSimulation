@@ -860,7 +860,12 @@ class _FluidPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.5
       ..color = Colors.white38;
-    for (final o in obstacles) {
+    // Draw each obstacle's opaque fill immediately followed by its outline,
+    // back-to-front (top of canvas first). A nearer obstacle's fill paints
+    // over the farther one's outline where they overlap, so overlaps read as
+    // clean occlusion (lower = in front) with no internal seams.
+    final ordered = [...obstacles]..sort((a, b) => a.y.compareTo(b.y));
+    for (final o in ordered) {
       final c = Offset(o.x * size.width, o.y * size.height);
       // Inflate so the vector shape hides the rasterized cells; an offset
       // of d grows an equilateral triangle's circumradius by 2d.
