@@ -61,6 +61,7 @@ class _SimulationPageState extends State<SimulationPage>
   double _wind = 70; // cells/sec left-to-right inflow; 0 = closed box
   bool _settingsOpen = false;
   bool _showIntro = true;
+  bool _running = true; // false = simulation paused (ticker keeps idling)
   RenderMode _mode = RenderMode.ink;
   int _warmup = 0; // frames to pre-simulate at startup (?warmup=N)
 
@@ -270,6 +271,12 @@ class _SimulationPageState extends State<SimulationPage>
   void _onTick(Duration elapsed) {
     final solver = _solver;
     if (solver == null) {
+      _lastTick = elapsed;
+      return;
+    }
+    // Paused: keep the ticker idling (so resume gets a sane dt) but freeze the
+    // sim — no stepping, no repaint.
+    if (!_running) {
       _lastTick = elapsed;
       return;
     }
@@ -619,6 +626,12 @@ class _SimulationPageState extends State<SimulationPage>
             height: 24,
             margin: const EdgeInsets.symmetric(horizontal: 4),
             color: Colors.white24,
+          ),
+          IconButton(
+            tooltip: _running ? 'Pause simulation' : 'Resume simulation',
+            icon: Icon(_running ? Icons.pause : Icons.play_arrow),
+            color: _running ? Colors.white70 : Colors.cyanAccent,
+            onPressed: () => setState(() => _running = !_running),
           ),
           IconButton(
             tooltip: 'Render mode: ${_mode.name} (tap to cycle)',
