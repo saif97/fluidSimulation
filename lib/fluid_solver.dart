@@ -1,7 +1,10 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:ui';
 
-enum ObstacleShape { circle, box, triangle }
+import 'shapes.dart';
+
+enum ObstacleShape { circle, box, triangle, cow }
 
 /// An obstacle in normalized coordinates (x, y in 0..1 of the canvas).
 /// [size] is the half-extent / radius as a fraction of canvas height.
@@ -28,6 +31,15 @@ class Obstacle {
         return dx.abs() < size && dy.abs() < size;
       case ObstacleShape.triangle:
         return _inTriangle(dx, dy, size);
+      case ObstacleShape.cow:
+        final lx = dx / size, ly = dy / size;
+        // Cheap bbox reject so rasterizing the grid doesn't run the full
+        // point-in-path test for every cell, only those over the cow.
+        final b = SvgShapes.cow.bounds;
+        if (lx < b.left || lx > b.right || ly < b.top || ly > b.bottom) {
+          return false;
+        }
+        return SvgShapes.cow.path.contains(Offset(lx, ly));
     }
   }
 

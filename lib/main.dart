@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 
 import 'fluid_solver.dart';
+import 'shapes.dart';
 
 void main() => runApp(const FluidApp());
 
@@ -27,7 +28,7 @@ class FluidApp extends StatelessWidget {
   }
 }
 
-enum Tool { stir, circle, box, triangle, eraser }
+enum Tool { stir, circle, box, triangle, cow, eraser }
 
 enum RenderMode { ink, particles, heat }
 
@@ -88,8 +89,9 @@ class _SimulationPageState extends State<SimulationPage>
   final ValueNotifier<ui.Vertices?> _mesh = ValueNotifier(null);
 
   final List<Obstacle> _obstacles = [
-    // Default obstacle so the wind tunnel sheds vortices from frame one.
-    Obstacle(shape: ObstacleShape.circle, x: 0.28, y: 0.5, size: 0.09),
+    // Default obstacle: a cow facing into the wind, shedding vortices from
+    // frame one (and a nod to the app icon).
+    Obstacle(shape: ObstacleShape.cow, x: 0.32, y: 0.52, size: 0.17),
   ];
   Obstacle? _dragged;
   Tool _tool = Tool.stir;
@@ -427,6 +429,7 @@ class _SimulationPageState extends State<SimulationPage>
       case Tool.circle:
       case Tool.box:
       case Tool.triangle:
+      case Tool.cow:
         final hit = _hitObstacle(n);
         if (hit != null) {
           _dragged = hit;
@@ -434,9 +437,15 @@ class _SimulationPageState extends State<SimulationPage>
           final shape = switch (_tool) {
             Tool.circle => ObstacleShape.circle,
             Tool.box => ObstacleShape.box,
+            Tool.cow => ObstacleShape.cow,
             _ => ObstacleShape.triangle,
           };
-          _dragged = Obstacle(shape: shape, x: n.dx, y: n.dy);
+          _dragged = Obstacle(
+            shape: shape,
+            x: n.dx,
+            y: n.dy,
+            size: shape == ObstacleShape.cow ? 0.17 : 0.07,
+          );
           _obstacles.add(_dragged!);
         }
         solver.rebuildSolids(_obstacles);
@@ -460,6 +469,7 @@ class _SimulationPageState extends State<SimulationPage>
       case Tool.circle:
       case Tool.box:
       case Tool.triangle:
+      case Tool.cow:
         final o = _dragged;
         if (o == null) return;
         o.x = n.dx;
@@ -602,6 +612,7 @@ class _SimulationPageState extends State<SimulationPage>
           _toolButton(Tool.circle, Icons.circle_outlined, 'Place circle'),
           _toolButton(Tool.box, Icons.crop_square, 'Place box'),
           _toolButton(Tool.triangle, Icons.change_history, 'Place triangle'),
+          _toolButton(Tool.cow, Icons.pets, 'Place cow'),
           _toolButton(Tool.eraser, Icons.auto_fix_high, 'Erase object'),
           Container(
             width: 1,
@@ -862,6 +873,15 @@ class _FluidPainter extends CustomPainter {
           ..lineTo(c.dx - r * c30, c.dy + r * 0.5)
           ..lineTo(c.dx + r * c30, c.dy + r * 0.5)
           ..close();
+      case ObstacleShape.cow:
+        // Scale the unit-normalized cow path by r and translate to center c —
+        // same path the solver hit-tests against, so mask and art align.
+        return SvgShapes.cow.path.transform(Float64List.fromList([
+          r, 0, 0, 0, //
+          0, r, 0, 0, //
+          0, 0, 1, 0, //
+          c.dx, c.dy, 0, 1,
+        ]));
     }
   }
 
